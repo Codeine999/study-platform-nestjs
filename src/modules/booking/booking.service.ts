@@ -1,0 +1,315 @@
+import { InjectQueue } from '@nestjs/bullmq';
+import {
+    BadRequestException,
+    ForbiddenException,
+    Injectable,
+    NotFoundException,
+} from '@nestjs/common';
+import { InjectModel } from '@nestjs/mongoose';
+import { Queue } from 'bullmq';
+import dayjs from 'dayjs';
+import 'dayjs/locale/th';
+import { isValidObjectId, Model, Types } from 'mongoose';
+import { BullMQJob } from 'src/shared/enums/bull-mq.enum';
+import { SlotStatus } from 'src/shared/enums/slot.enum';
+import { secondsToMilliseconds } from 'src/shared/utils/shared.util';
+import { Slot } from '../slots/schemas/slot.schema';
+import { Teacher } from '../teachers/schemas/teacher.schema';
+import { Booking } from './schemas/booking.schema';
+import { CreateBookingDto, MySlotResponse } from './schemas/booking.zod.schema';
+
+@Injectable()
+export class BookingService {
+    constructor(
+        @InjectQueue('booking') private bookingQueue: Queue,
+        @InjectModel(Booking.name) private bookingModel: Model<Booking>,
+        @InjectModel(Teacher.name) private teacherModel: Model<Teacher>,
+        @InjectModel(Slot.name) private slotModel: Model<Slot>,
+    ) {}
+
+    private async addNotifyBeforeClassStartsQueue(booking: Booking) {
+        const now = dayjs();
+
+        const secondsUntilClassStarts =
+            dayjs(booking.startTime).unix() - now.unix();
+
+        const secondsToNotifyUsersBeforeClass = 15 * 60; // : 15 นาทีก่อนคลาสเริ่่ม
+
+        const secondsToNotifyUsers =
+            secondsUntilClassStarts - secondsToNotifyUsersBeforeClass;
+
+        await this.bookingQueue.add(BullMQJob.NOTIFY_BEFORE_CLASS, booking, {
+            delay: secondsToMilliseconds(secondsToNotifyUsers),
+        });
+    }
+
+    private async addCheckParticipantsBeforeClassEndsQueue(booking: Booking) {
+        const now = dayjs();
+
+        const secondsUntilClassEnds =
+            dayjs(booking.endTime).unix() - now.unix();
+
+        const secondsToCheckBeforeClassEnds = 5 * 60; // : 5 นาทีก่อนเลิกคลาส
+
+        const secondsToCheck =
+            secondsUntilClassEnds - secondsToCheckBeforeClassEnds;
+
+        await this.bookingQueue.add(
+            BullMQJob.CHECK_PARTICIPANTS_BEFORE_CLASS_ENDS,
+            booking,
+            { delay: secondsToMilliseconds(secondsToCheck) },
+        );
+    }
+
+    private async addEndCallQueue(booking: Booking) {
+        const now = dayjs();
+
+        const secondsUntilClassEnds =
+            dayjs(booking.endTime).unix() - now.unix();
+
+        await this.bookingQueue.add(BullMQJob.END_CALL, booking, {
+            delay: secondsToMilliseconds(secondsUntilClassEnds),
+        });
+    }
+
+    async createBookingSlot(
+        slotId: string,
+        studentId: string,
+        body: CreateBookingDto,
+    ): Promise<Booking> {
+        const studentObjId = new Types.ObjectId(studentId);
+        const subjectObjId = new Types.ObjectId(body.subject);
+
+        if (!Types.ObjectId.isValid(body.subject)) {
+            throw new BadRequestException('subject id ไม่ถูกต้อง');
+        }
+
+        const slot = await this.slotModel.findById(slotId);
+        if (!slot) throw new NotFoundException('ไม่พบ slot ที่ต้องการจอง');
+
+        const existingBooking = await this.bookingModel.findOne({
+            slotId: slot._id,
+            studentId: studentObjId,
+            status: 'pending',
+        });
+
+        if (existingBooking)
+            throw new BadRequestException('คุณได้จอง slot นี้ไปแล้ว');
+
+        if (slot.status !== SlotStatus.AVAILABLE) {
+            throw new BadRequestException('Slot นี้ถูกจองหรือไม่ว่างแล้ว');
+        }
+
+        const booking = await this.bookingModel.create({
+            studentId: studentObjId,
+            teacherId: slot.teacherId,
+            slotId: slot._id,
+            startTime: slot.startTime,
+            endTime: slot.endTime,
+            date: slot.date,
+            price: slot.price,
+            status: 'pending',
+            subject: subjectObjId,
+        });
+
+        slot.status = SlotStatus.PENDING;
+        slot.bookingId = booking._id;
+        slot.bookedBy = studentObjId;
+        slot.subject = subjectObjId;
+        await slot.save();
+
+        await this.addNotifyBeforeClassStartsQueue(booking);
+
+        await this.addCheckParticipantsBeforeClassEndsQueue(booking);
+
+        await this.addEndCallQueue(booking);
+
+        return booking;
+    }
+
+    async getMySlot(userId: string): Promise<MySlotResponse[]> {
+        const bookings = (await this.bookingModel
+            .find({
+                studentId: new Types.ObjectId(userId),
+                status: { $in: ['pending', 'paid'] },
+            })
+            .populate('subject', '_id name')
+            .populate({
+                path: 'teacherId',
+                select: 'name lastName verifyStatus userId',
+                populate: {
+                    path: 'userId',
+                    select: 'profileImage',
+                },
+            })
+            .lean()) as any;
+
+        const sorted = bookings.sort((a, b) => {
+            const statusOrder = { paid: 0, pending: 1 };
+            const statusA = statusOrder[a.status] ?? 99;
+            const statusB = statusOrder[b.status] ?? 99;
+
+            if (statusA !== statusB) return statusA - statusB;
+            return (
+                new Date(a.startTime).getTime() -
+                new Date(b.startTime).getTime()
+            );
+        });
+
+        return sorted.map(
+            ({ teacherId, startTime, endTime, date, paidAt, ...rest }) => {
+                const teacher: any = teacherId;
+                const startLocal = dayjs.utc(startTime).tz('Asia/Bangkok');
+                const endLocal = dayjs.utc(endTime).tz('Asia/Bangkok');
+
+                const dateDisplay = dayjs(startLocal)
+                    .locale('th')
+                    .format('D MMMM YYYY');
+                const start = startLocal.format('HH:mm');
+                const end = endLocal.format('HH:mm');
+                const paidAtDisplay = paidAt
+                    ? dayjs(paidAt).locale('th').format('D MMMM YYYY')
+                    : null;
+
+                return {
+                    ...rest,
+                    date: dateDisplay,
+                    startTime: start,
+                    endTime: end,
+                    paidAt: paidAtDisplay,
+                    teacher: {
+                        _id: teacher?._id,
+                        name: teacher?.name,
+                        lastName: teacher?.lastName,
+                        verifyStatus: teacher?.verifyStatus,
+                        profileImage: teacher?.userId?.profileImage ?? null,
+                    },
+                };
+            },
+        );
+    }
+
+    async getBookingById(
+        bookingId: string,
+        userId: string,
+    ): Promise<MySlotResponse> {
+        if (!isValidObjectId(bookingId)) {
+            throw new BadRequestException('Booking ID ไม่ถูกต้อง');
+        }
+
+        const booking = await this.bookingModel
+            .findById(bookingId)
+            .populate('subject', '_id name')
+            .populate({
+                path: 'teacherId',
+                select: 'name lastName userId verifyStatus',
+                populate: {
+                    path: 'userId',
+                    select: 'profileImage',
+                },
+            })
+            .lean();
+
+        if (!booking) {
+            throw new NotFoundException('ไม่พบข้อมูลการจอง');
+        }
+
+        const teacherRecord = await this.teacherModel.findOne({
+            userId: new Types.ObjectId(userId),
+        });
+
+        const isStudent = userId === booking.studentId.toString();
+        const isTeacher =
+            teacherRecord &&
+            teacherRecord._id.toString() === booking.teacherId?._id.toString();
+
+        if (!isStudent && !isTeacher) {
+            throw new ForbiddenException(
+                'คุณไม่มีสิทธิ์เข้าถึงข้อมูลการจองนี้',
+            );
+        }
+
+        const teacher: any = booking.teacherId;
+        const startLocal = dayjs.utc(booking.startTime).tz('Asia/Bangkok');
+        const endLocal = dayjs.utc(booking.endTime).tz('Asia/Bangkok');
+
+        const dateDisplay = dayjs(startLocal)
+            .locale('th')
+            .format('D MMMM YYYY');
+        const start = startLocal.format('HH:mm');
+        const end = endLocal.format('HH:mm');
+
+        const { teacherId, startTime, endTime, paidAt, ...rest } = booking;
+
+        const paidAtDisplay = paidAt
+            ? dayjs(paidAt).locale('th').format('D MMMM YYYY')
+            : null;
+
+        return {
+            ...rest,
+            date: dateDisplay,
+            startTime: start,
+            endTime: end,
+            paidAt: paidAtDisplay,
+            teacher: {
+                _id: teacher?._id,
+                name: teacher?.name,
+                lastName: teacher?.lastName,
+                verifyStatus: teacher?.verifyStatus,
+                profileImage: teacher?.userId?.profileImage ?? null,
+            },
+        };
+    }
+
+    async getHistoryBookingMine(userId: string): Promise<MySlotResponse[]> {
+        const bookings = (await this.bookingModel
+            .find({
+                studentId: new Types.ObjectId(userId),
+                status: { $in: ['studied', 'expired', 'rejected'] },
+            })
+            .populate('subject', '_id name')
+            .populate({
+                path: 'teacherId',
+                select: 'name lastName userId verifyStatus',
+                populate: {
+                    path: 'userId',
+                    select: 'profileImage',
+                },
+            })
+            .sort({ startTime: -1 })
+            .lean()) as any;
+
+        return bookings.map(
+            ({ teacherId, startTime, endTime, date, paidAt, ...rest }) => {
+                const teacher: any = teacherId;
+
+                const startLocal = dayjs.utc(startTime).tz('Asia/Bangkok');
+                const endLocal = dayjs.utc(endTime).tz('Asia/Bangkok');
+
+                const dateDisplay = dayjs(startLocal)
+                    .locale('th')
+                    .format('D MMMM YYYY');
+                const start = startLocal.format('HH:mm');
+                const end = endLocal.format('HH:mm');
+                const paidAtDisplay = paidAt
+                    ? dayjs(paidAt).locale('th').format('D MMMM YYYY')
+                    : null;
+
+                return {
+                    ...rest,
+                    date: dateDisplay,
+                    startTime: start,
+                    endTime: end,
+                    paidAt: paidAtDisplay,
+                    teacher: {
+                        _id: teacher?._id,
+                        name: teacher?.name,
+                        lastName: teacher?.lastName,
+                        verifyStatus: teacher?.verifyStatus,
+                        profileImage: teacher?.userId?.profileImage ?? null,
+                    },
+                };
+            },
+        );
+    }
+}

@@ -1,0 +1,43 @@
+import { createZodDto } from 'nestjs-zod';
+import { z } from 'zod';
+
+const objectIdSchema = z
+  .string()
+  .regex(/^[0-9a-fA-F]{24}$/, 'รหัส ObjectId ไม่ถูกต้อง');
+
+export const UpdateProfileSchema = z.object({
+  name: z
+    .string()
+    .min(2, 'กรุณากรอกชื่อ')
+    .max(50, 'ชื่อจริงห้ามเกิน 50 ตัวอักษร')
+    .optional(),
+  lastName: z
+    .string()
+    .min(2, 'กรุณากรอกนามสกุล')
+    .max(50, 'นามสกุลห้ามเกิน 50 ตัวอักษร')
+    .optional()
+    .describe('นามสกุล'),
+  email: z
+    .string()
+    .email('กรุณากรอกอีเมลให้ถูกต้อง')
+    .min(4, 'กรุณากรอกอีเมล')
+    .max(50, 'อีเมลห้ามเกิน 50 ตัวอักษร')
+    .optional()
+    .describe('อีเมล'),
+  nickName: z.
+    string()
+    .min(2, 'กรุณากรอกชื่อเล่น')
+    .max(20, 'ชื่อเล่นห้ามเกิน 20 ตัวอักษร')
+    .optional(),
+  age:
+    z.number()
+      .int()
+      .positive()
+      .optional(),
+  subjects: z
+    .array(objectIdSchema)
+    .optional(),
+});
+
+export class UpdateProfileDto extends createZodDto(UpdateProfileSchema) { }
+
