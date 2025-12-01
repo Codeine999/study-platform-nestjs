@@ -28,7 +28,7 @@ jobs:
         with:
           context: .
           push: true
-          tags: ghcr.io/${{ github.repository_owner }}/study-api:latest
+          tags: ghcr.io/codeine999/study-api:latest
 
       - name: Deploy to EC2
         uses: appleboy/ssh-action@v0.1.10
